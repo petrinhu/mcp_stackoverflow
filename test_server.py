@@ -1,17 +1,22 @@
-"""Testes do servidor MCP stdio `stackoverflow` (stdlib apenas, unittest).
+"""Tests for the `stackoverflow` MCP stdio server (stdlib only, unittest).
 
-Roda com: python3 -m unittest test_server -v
+Run with: python3 -m unittest test_server -v
 
-Teste de integração real (rede) é gated por SO_MCP_LIVE=1 (opcional, não roda por padrão).
+Live (network) integration test is gated by SO_MCP_LIVE=1 (opt-in, does not
+run by default).
 """
+import gzip
+import json
 import os
+import socket
 import unittest
-from unittest.mock import patch
+import urllib.error
+from unittest.mock import MagicMock, patch
 
 import server
 
 
-# --- Fixtures no formato da API api.stackexchange.com/2.3 (já "descomprimidas") ---
+# --- Fixtures in the api.stackexchange.com/2.3 format (already "decompressed") ---
 
 FIXTURE_SEARCH = {
     "items": [
@@ -157,6 +162,26 @@ class TestHtmlToText(unittest.TestCase):
         self.assertIn("a", result)
         self.assertIn("code", result)
 
+    def test_list_items_become_newlines(self):
+        result = server.html_to_text("<ul><li>a</li><li>b</li></ul>")
+        self.assertEqual(result, "a\nb")
+
+    def test_headings_become_newlines(self):
+        result = server.html_to_text("<h1>Title</h1><h3>Sub</h3>body")
+        self.assertEqual(result, "Title\nSub\nbody")
+
+    def test_div_becomes_newline(self):
+        result = server.html_to_text("<div>a</div><div>b</div>")
+        self.assertEqual(result, "a\nb")
+
+    def test_blockquote_becomes_newline(self):
+        result = server.html_to_text("<blockquote>quoted</blockquote>after")
+        self.assertEqual(result, "quoted\nafter")
+
+    def test_table_row_becomes_newline(self):
+        result = server.html_to_text("<table><tr><td>a</td></tr><tr><td>b</td></tr></table>")
+        self.assertEqual(result, "a\nb")
+
     def test_empty_string(self):
         self.assertEqual(server.html_to_text(""), "")
 
@@ -178,22 +203,110 @@ class TestFormatters(unittest.TestCase):
 
     def test_format_search_empty(self):
         text = server.format_search(FIXTURE_SEARCH_EMPTY)
-        self.assertIn("nenhum resultado", text.lower())
+        self.assertIn("no results found", text.lower())
 
     def test_format_question(self):
         text = server.format_question(FIXTURE_QUESTION)
         self.assertIn("How to do X in Python?", text)
         self.assertIn("python", text)
-        self.assertIn("Use x.do() .".replace(" .", ".") if False else "Use", text)
+        self.assertIn("Use", text)
 
     def test_format_question_empty(self):
         text = server.format_question(FIXTURE_QUESTION_EMPTY)
-        self.assertIn("não encontrada", text.lower())
+        self.assertIn("not found", text.lower())
 
     def test_format_answers_accepted_first(self):
         text = server.format_answers(FIXTURE_ANSWERS, top=3)
         self.assertLess(text.index("Use B"), text.index("Try A"))
-        self.assertIn("aceita", text)
+        self.assertIn("accepted", text)
+
+
+class TestHttpGetJson(unittest.TestCase):
+    """Exercises the network seam by mocking urllib.request.urlopen directly."""
+
+    @staticmethod
+    def _make_response(body_bytes, content_encoding=""):
+        headers = {"Content-Encoding": content_encoding} if content_encoding else {}
+        resp = MagicMock()
+        resp.read.return_value = body_bytes
+        resp.headers = headers
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    def test_timeout_error_raises_runtime_error_with_timeout_message(self):
+        with patch("urllib.request.urlopen", side_effect=TimeoutError):
+            with self.assertRaises(RuntimeError) as ctx:
+                server._http_get_json("http://example.test")
+        self.assertIn("timeout", str(ctx.exception).lower())
+
+    def test_socket_timeout_alias_raises_same_message(self):
+        # socket.timeout is an alias of TimeoutError since Python 3.10; this
+        # proves both trigger the same handling path.
+        with patch("urllib.request.urlopen", side_effect=socket.timeout):
+            with self.assertRaises(RuntimeError) as ctx:
+                server._http_get_json("http://example.test")
+        self.assertIn("timeout", str(ctx.exception).lower())
+
+    def test_url_error_raises_network_error(self):
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("boom")):
+            with self.assertRaises(RuntimeError) as ctx:
+                server._http_get_json("http://example.test")
+        self.assertIn("network error", str(ctx.exception))
+
+    def test_gzip_response_returns_dict(self):
+        payload = json.dumps({"ok": True}).encode("utf-8")
+        compressed = gzip.compress(payload)
+        resp = self._make_response(compressed, content_encoding="gzip")
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = server._http_get_json("http://example.test")
+        self.assertEqual(result, {"ok": True})
+
+    def test_plain_response_returns_dict(self):
+        payload = json.dumps({"ok": True}).encode("utf-8")
+        resp = self._make_response(payload)
+        with patch("urllib.request.urlopen", return_value=resp):
+            result = server._http_get_json("http://example.test")
+        self.assertEqual(result, {"ok": True})
+
+    def test_invalid_json_raises_runtime_error(self):
+        resp = self._make_response(b"not json")
+        with patch("urllib.request.urlopen", return_value=resp):
+            with self.assertRaises(RuntimeError) as ctx:
+                server._http_get_json("http://example.test")
+        self.assertIn("not valid JSON", str(ctx.exception))
+
+
+class TestParseQuestionId(unittest.TestCase):
+    def test_int_is_accepted(self):
+        self.assertEqual(server._parse_question_id({"question_id": 111}), 111)
+
+    def test_numeric_string_is_accepted(self):
+        self.assertEqual(server._parse_question_id({"question_id": "123"}), 123)
+
+    def test_numeric_string_with_whitespace_is_accepted(self):
+        self.assertEqual(server._parse_question_id({"question_id": "  123  "}), 123)
+
+    def test_garbage_string_raises_clean_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            server._parse_question_id({"question_id": "abc"})
+        self.assertIn("must be an integer", str(ctx.exception))
+        self.assertNotIn("invalid literal", str(ctx.exception))
+
+    def test_non_integer_float_raises_clean_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            server._parse_question_id({"question_id": 1.5})
+        self.assertIn("must be an integer", str(ctx.exception))
+
+    def test_bool_raises_clean_value_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            server._parse_question_id({"question_id": True})
+        self.assertIn("must be an integer", str(ctx.exception))
+
+    def test_none_raises_required_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            server._parse_question_id({"question_id": None})
+        self.assertIn("required", str(ctx.exception))
 
 
 class TestDispatch(unittest.TestCase):
@@ -274,6 +387,18 @@ class TestToolsCall(unittest.TestCase):
         resp = server.handle_message(msg)
         self.assertTrue(resp["result"]["isError"])
 
+    def test_so_search_whitespace_only_query_is_error(self):
+        server._http_get_json = lambda url: FIXTURE_SEARCH
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "so_search", "arguments": {"query": "   "}},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("required", resp["result"]["content"][0]["text"])
+
     def test_so_get_question_success(self):
         server._http_get_json = lambda url: FIXTURE_QUESTION
         msg = {
@@ -286,6 +411,81 @@ class TestToolsCall(unittest.TestCase):
         text = resp["result"]["content"][0]["text"]
         self.assertIn("How to do X in Python?", text)
         self.assertIn("python", text)
+
+    def test_so_get_question_numeric_string_id_succeeds(self):
+        server._http_get_json = lambda url: FIXTURE_QUESTION
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": {"question_id": "123"}},
+        }
+        resp = server.handle_message(msg)
+        self.assertNotIn("isError", resp["result"])
+
+    def test_so_get_question_garbage_id_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_QUESTION
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": {"question_id": "abc"}},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        text = resp["result"]["content"][0]["text"]
+        self.assertIn("must be an integer", text)
+        self.assertNotIn("invalid literal", text)
+
+    def test_so_get_question_float_id_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_QUESTION
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": {"question_id": 1.5}},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("must be an integer", resp["result"]["content"][0]["text"])
+
+    def test_so_get_question_bool_id_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_QUESTION
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": {"question_id": True}},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("must be an integer", resp["result"]["content"][0]["text"])
+
+    def test_so_get_question_missing_id_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_QUESTION
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": {"question_id": None}},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("required", resp["result"]["content"][0]["text"])
+
+    def test_non_object_arguments_is_clean_error(self):
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "so_get_question", "arguments": "x"},
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        text = resp["result"]["content"][0]["text"]
+        self.assertIn("'arguments' must be an object", text)
+        self.assertNotIn("AttributeError", text)
+        self.assertNotIn("NoneType", text)
 
     def test_so_get_answers_success_top_clamped_and_accepted_first(self):
         server._http_get_json = lambda url: FIXTURE_ANSWERS
@@ -300,7 +500,7 @@ class TestToolsCall(unittest.TestCase):
         }
         resp = server.handle_message(msg)
         text = resp["result"]["content"][0]["text"]
-        self.assertIn("aceita", text)
+        self.assertIn("accepted", text)
         self.assertIn("Use B", text)
 
     def test_unknown_tool_is_error(self):
@@ -315,7 +515,7 @@ class TestToolsCall(unittest.TestCase):
 
     def test_network_error_is_error(self):
         def boom(url):
-            raise RuntimeError("erro de rede: timeout")
+            raise RuntimeError("network error: timeout")
 
         server._http_get_json = boom
         msg = {
@@ -326,7 +526,7 @@ class TestToolsCall(unittest.TestCase):
         }
         resp = server.handle_message(msg)
         self.assertTrue(resp["result"]["isError"])
-        self.assertIn("erro de rede", resp["result"]["content"][0]["text"])
+        self.assertIn("network error", resp["result"]["content"][0]["text"])
 
     def test_api_error_message_propagates_as_error(self):
         server._http_get_json = lambda url: FIXTURE_API_ERROR
@@ -342,7 +542,7 @@ class TestToolsCall(unittest.TestCase):
 
 
 class TestLive(unittest.TestCase):
-    """Integração real com a API. Gated: só roda com SO_MCP_LIVE=1."""
+    """Real integration with the API. Gated: only runs with SO_MCP_LIVE=1."""
 
     @unittest.skipUnless(
         os.environ.get("SO_MCP_LIVE") == "1", "live test opt-in via SO_MCP_LIVE=1"
