@@ -887,6 +887,58 @@ class TestStdioProcessSurvives(unittest.TestCase):
         self.assertEqual(responses[2]["id"], 2)
         self.assertIn("protocolVersion", responses[2]["result"])
 
+    def test_dispatch_exception_answers_with_internal_error_instead_of_silence(self):
+        # `params.name` as a list is a realistic malformed request (a buggy
+        # client, not a fabricated edge case): TOOL_HANDLERS.get(name) raises
+        # TypeError("unhashable type: 'list'") from *outside* the inner
+        # try/except in handle_message's tools/call branch, so the exception
+        # propagates all the way up into main()'s own dispatch try/except.
+        # Before FIX-3, main() swallowed this with a bare `continue` and the
+        # id=7 request got no response at all - the caller would hang until
+        # its own timeout. This proves the -32603 response is sent instead,
+        # and that the process survives to answer the next request too.
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
+        payload = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": ["so_search"], "arguments": {}},
+                }
+            )
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 8, "method": "ping"})
+            + "\n"
+        ).encode("utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            out, _err = proc.communicate(input=payload, timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+        self.assertEqual(proc.returncode, 0, "the server process must not crash/exit")
+
+        lines = [line for line in out.decode("utf-8", errors="replace").splitlines() if line.strip()]
+        responses = [json.loads(line) for line in lines]
+        self.assertEqual(len(responses), 2, f"expected one response per input line, got {responses}")
+
+        # line 1: the dispatch TypeError must not be swallowed - id 7 is owed
+        # a response, and it must be a JSON-RPC Internal error, not silence
+        self.assertEqual(responses[0]["id"], 7)
+        self.assertEqual(responses[0]["error"]["code"], -32603)
+
+        # line 2: the process is still alive and dispatches normally afterwards
+        self.assertEqual(responses[1]["id"], 8)
+        self.assertEqual(responses[1]["result"], {})
+
 
 class TestLive(unittest.TestCase):
     """Real integration with the API. Gated: only runs with SO_MCP_LIVE=1."""

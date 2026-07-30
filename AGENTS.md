@@ -27,7 +27,7 @@ python3 -m unittest test_server -v
 
 # a single test class or test method
 python3 -m unittest test_server.TestDispatch -v
-python3 -m unittest test_server.TestDispatch.test_initialize_echoes_protocol_version -v
+python3 -m unittest test_server.TestDispatch.test_initialize_echoes_supported_protocol_version -v
 
 # syntax-only check (what CI runs before the suite)
 python3 -m py_compile server.py test_server.py
