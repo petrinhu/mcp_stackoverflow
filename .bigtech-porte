@@ -1,6 +1,10 @@
-porte=solo
+porte=early
 variante=Pipeline-Sprint
 data=2026-07-30
-classificado_por=orquestrador (Cósimo não entregou o mapa após 4 pedidos)
-justificativa=MCP stdio de ~410 linhas, stdlib puro, 3 tools read-only, 1 mantenedor, open source sem receita, sem PII, sem compliance regulatória. C-levels ativos: Caetano (CTO, auditoria e plano). Dormentes: todos os demais — não há mercado a atacar (CMO/CRO/PMM), receita a modelar (CFO), dado como ativo (CDO), superfície regulatória (CLO/CISO além do básico) nem execução cross-funcional a coordenar (COO) num projeto de dois arquivos.
-gatilho_reavaliacao=se ganhar usuários externos com issues recorrentes, se passar a tratar credencial de terceiro, ou se a superfície passar de ~5 tools
+classificado_por=cosimo-chief-of-staff (Chief of Staff)
+justificativa=Piso da escala. Complexidade, criticidade e escala baixas, compliance zero. Nao rebaixa para "solo" porque headcount 1 nao e criterio de porte. Dois adendos de Lean forcados pela exposicao publica do repo: CI e doc de repo.
+c_levels_ativos=Caetano/CTO (unico que roda de verdade; entregou a auditoria e o plano) + Celso/CEO apenas no go/no-go do push final, na pratica exercido pelo lider
+c_levels_dormentes=Capitolino/CPO, Camilo/CMO, Cosmo/COO, Narciso/CISO, Claudio/CLO, Candido/CDO, Caio/CAIO, Confucio/CFO, Cicero/CRO
+agents_operacionais=backend-engineer, qa-engineer, devops-sre, technical-writer; teto de 4 sonnet concorrentes, sempre em arquivos disjuntos; 1 slot de review adversarial que EXECUTA o codigo (implementer != reviewer, inegociavel em qualquer porte)
+cerimonia=nenhuma. Cadencia = onda: plano do CTO -> fan-out pelo orquestrador -> review adversarial -> commit por fatia citando o ID -> push ao fim da onda completa com CI verde
+gatilho_reavaliacao=(a) contribuicao externa recorrente (>3 PRs de terceiros) sobe para Lean e acorda Capitolino; (b) escrita na API (OAuth, post/vote) acorda Narciso e Claudio; (c) persistir conteudo de usuario em disco acorda Narciso; (d) virar pacote no PyPI acorda release-manager
