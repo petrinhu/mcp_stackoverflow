@@ -18,11 +18,13 @@ import urllib.parse
 import urllib.request
 
 API_BASE = "https://api.stackexchange.com/2.3"
-SITE = "stackoverflow"
+DEFAULT_SITE = "stackoverflow"
 HTTP_TIMEOUT_S = 20
 SERVER_NAME = "stackoverflow"
 SERVER_VERSION = "0.1.0"
-DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+# Ordered newest-first: a supported version is echoed back as-is; an
+# unsupported (or missing) one falls back to SUPPORTED_PROTOCOL_VERSIONS[0].
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 
 # --------------------------------------------------------------------------
@@ -49,12 +51,30 @@ def _key_param():
     return f"&key={urllib.parse.quote(key)}"
 
 
-def build_search_url(query, tag=None, pagesize=5):
+_SITE_RE = re.compile(r"^[a-z0-9.-]+$")
+
+
+def _validate_site(site):
+    """Validates the *format* of a Stack Exchange site key (e.g.
+    'stackoverflow', 'askubuntu'). Existence is left to the API itself
+    (it 404s on an unknown site) - this only guards against building an
+    absurd/unsafe URL from garbage input. None defaults to DEFAULT_SITE.
+    """
+    if site is None:
+        return DEFAULT_SITE
+    if not isinstance(site, str) or not _SITE_RE.match(site):
+        raise ValueError(
+            "'site' must be a Stack Exchange site key, e.g. 'stackoverflow' or 'askubuntu'"
+        )
+    return site
+
+
+def build_search_url(query, tag=None, pagesize=5, site=DEFAULT_SITE):
     pagesize = clamp(pagesize, 1, 20)
     q = urllib.parse.quote(query or "")
     url = (
         f"{API_BASE}/search/advanced?order=desc&sort=relevance&q={q}"
-        f"&site={SITE}&pagesize={pagesize}&filter=default"
+        f"&site={site}&pagesize={pagesize}&filter=default"
     )
     if tag:
         url += f"&tagged={urllib.parse.quote(tag)}"
@@ -62,15 +82,15 @@ def build_search_url(query, tag=None, pagesize=5):
     return url
 
 
-def build_question_url(question_id):
-    return f"{API_BASE}/questions/{int(question_id)}?site={SITE}&filter=withbody{_key_param()}"
+def build_question_url(question_id, site=DEFAULT_SITE):
+    return f"{API_BASE}/questions/{int(question_id)}?site={site}&filter=withbody{_key_param()}"
 
 
-def build_answers_url(question_id, top=3):
+def build_answers_url(question_id, top=3, site=DEFAULT_SITE):
     top = clamp(top, 1, 10)
     return (
         f"{API_BASE}/questions/{int(question_id)}/answers?order=desc&sort=votes"
-        f"&site={SITE}&filter=withbody&pagesize={top}{_key_param()}"
+        f"&site={site}&filter=withbody&pagesize={top}{_key_param()}"
     )
 
 
@@ -100,6 +120,58 @@ def html_to_text(s):
     return s.strip()
 
 
+_LOW_QUOTA_THRESHOLD = 30
+
+
+def _quota_warning(quota):
+    """Returns a warning to surface to the model/user when the daily quota
+    is running low (<= _LOW_QUOTA_THRESHOLD remaining), or "" otherwise.
+
+    Only mentions STACKEXCHANGE_KEY as the fix in keyless mode - a caller
+    that already has a key is already at the higher 10,000/day ceiling, so
+    telling them to set it again would be noise.
+    """
+    if quota is None or quota > _LOW_QUOTA_THRESHOLD:
+        return ""
+    warning = f"WARNING: only {quota} Stack Exchange API requests left today."
+    if not os.environ.get("STACKEXCHANGE_KEY"):
+        warning += (
+            " Set the STACKEXCHANGE_KEY environment variable to raise the daily "
+            "quota from 300 to 10,000: https://stackapps.com/apps/oauth/register"
+        )
+    return warning
+
+
+def _backoff_note(backoff):
+    """Returns a note to surface when the API asked for a backoff before the
+    next call, or "" otherwise.
+
+    Deliberately does not sleep: blocking here would freeze the whole stdio
+    protocol loop (including unrelated requests like `ping`) for however
+    long the API wants backed off. Reporting it and letting the MCP client
+    decide whether/how to slow down is the caller's call, not the server's.
+    """
+    if backoff is None:
+        return ""
+    return f"(the API requested a backoff of {backoff}s before the next call)"
+
+
+def _quota_and_backoff_suffix(data):
+    """Combines the quota-remaining line, low-quota warning, and backoff
+    note into the trailing block every tool's text output ends with."""
+    lines = []
+    quota = data.get("quota_remaining")
+    if quota is not None:
+        lines.append(f"(quota remaining: {quota})")
+    warning = _quota_warning(quota)
+    if warning:
+        lines.append(warning)
+    note = _backoff_note(data.get("backoff"))
+    if note:
+        lines.append(note)
+    return "\n".join(lines)
+
+
 def format_search(data):
     items = data.get("items") or []
     if not items:
@@ -112,9 +184,9 @@ def format_search(data):
         answered = "answered" if it.get("is_answered") else "no accepted answer"
         link = it.get("link") or ""
         lines.append(f"#{qid} [{score}] {title} ({answered}) - {link}")
-    quota = data.get("quota_remaining")
-    if quota is not None:
-        lines.append(f"(quota remaining: {quota})")
+    suffix = _quota_and_backoff_suffix(data)
+    if suffix:
+        lines.append(suffix)
     return "\n".join(lines)
 
 
@@ -129,9 +201,9 @@ def format_question(data):
     link = q.get("link") or ""
     body = html_to_text(q.get("body") or "")
     parts = [f"{title}", f"tags: {tags}", f"score: {score}", f"link: {link}", "", body]
-    quota = data.get("quota_remaining")
-    if quota is not None:
-        parts.append(f"\n(quota remaining: {quota})")
+    suffix = _quota_and_backoff_suffix(data)
+    if suffix:
+        parts.append("\n" + suffix)
     return "\n".join(parts)
 
 
@@ -151,9 +223,9 @@ def format_answers(data, top=3):
         body = html_to_text(a.get("body") or "")
         parts.append(f"[score {score}] ({accepted})\n{body}")
     text = "\n\n---\n\n".join(parts)
-    quota = data.get("quota_remaining")
-    if quota is not None:
-        text += f"\n\n(quota remaining: {quota})"
+    suffix = _quota_and_backoff_suffix(data)
+    if suffix:
+        text += "\n\n" + suffix
     return text
 
 
@@ -177,12 +249,7 @@ def _http_get_json(url):
             raw = resp.read()
             content_encoding = resp.headers.get("Content-Encoding", "")
     except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"HTTP error {exc.code}: {exc.reason} {body}".strip()) from exc
+        raise RuntimeError(_format_http_error(exc)) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"network error: {exc.reason}") from exc
     except TimeoutError as exc:
@@ -201,10 +268,65 @@ def _http_get_json(url):
         raise RuntimeError(f"response is not valid JSON: {exc}") from exc
 
 
+def _format_api_error(data):
+    """Builds the Stack Exchange API error message for an already-parsed
+    error payload (a dict with an 'error_id' key). Returns None when `data`
+    isn't an API error payload.
+
+    Shared by the HTTP-200-with-error-body path (_check_api_error) and the
+    HTTPError path (_format_http_error) so both produce the same message
+    format - the quota-exhausted case (error_id 502, throttle_violation) in
+    particular arrives as a plain HTTP 400, not a 200.
+    """
+    if not isinstance(data, dict) or data.get("error_id") is None:
+        return None
+    error_id = data.get("error_id")
+    error_name = data.get("error_name") or "unknown_error"
+    error_message = data.get("error_message") or "unknown API error"
+    text = f"Stack Exchange API error {error_id} ({error_name}): {error_message}"
+    if error_id == 502:
+        text += (
+            " The API is throttling this client. Wait before retrying, or set "
+            "the STACKEXCHANGE_KEY environment variable (free key, raises the "
+            "daily quota from 300 to 10,000): "
+            "https://stackapps.com/apps/oauth/register"
+        )
+    return text
+
+
+def _format_http_error(exc):
+    """Builds a clean message for an HTTPError.
+
+    The API's error bodies (including the throttle_violation one sent as a
+    plain HTTP 400 when the daily quota is exhausted) are gzip-compressed
+    just like successful responses - decompressing them here is what keeps
+    a keyless client that hits the 300/day ceiling from seeing raw gzip
+    bytes instead of an explanation.
+    """
+    try:
+        raw = exc.read()
+    except Exception:
+        raw = b""
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            raw = gzip.decompress(raw)
+        except OSError:
+            pass  # not valid gzip after all - fall through with the raw bytes
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        data = None
+    api_error_text = _format_api_error(data)
+    if api_error_text is not None:
+        return api_error_text
+    body = raw.decode("utf-8", errors="replace") if raw else ""
+    return f"HTTP error {exc.code}: {exc.reason} {body}".strip()
+
+
 def _check_api_error(data):
-    if isinstance(data, dict) and data.get("error_id") is not None:
-        msg = data.get("error_message") or "unknown API error"
-        raise RuntimeError(f"Stack Exchange API error ({data.get('error_id')}): {msg}")
+    text = _format_api_error(data)
+    if text is not None:
+        raise RuntimeError(text)
 
 
 # --------------------------------------------------------------------------
@@ -246,6 +368,16 @@ def _parse_question_id(args):
     raise ValueError("'question_id' must be an integer")
 
 
+def _log_backoff(data):
+    """Logs to stderr (never stdout) when the API asked for a backoff.
+    Side-effecting on purpose - kept out of the pure formatters so their
+    text-building stays trivially testable without capturing stderr.
+    """
+    backoff = data.get("backoff") if isinstance(data, dict) else None
+    if backoff is not None:
+        print(f"[stackoverflow-mcp] API requested a backoff of {backoff}s", file=sys.stderr)
+
+
 def tool_so_search(args):
     args = _require_object(args)
     query = args.get("query")
@@ -255,16 +387,20 @@ def tool_so_search(args):
         raise ValueError("'query' parameter is required")
     tag = args.get("tag")
     pagesize = clamp(args.get("pagesize", 5), 1, 20)
-    data = _http_get_json(build_search_url(query, tag, pagesize))
+    site = _validate_site(args.get("site"))
+    data = _http_get_json(build_search_url(query, tag, pagesize, site))
     _check_api_error(data)
+    _log_backoff(data)
     return format_search(data)
 
 
 def tool_so_get_question(args):
     args = _require_object(args)
     question_id = _parse_question_id(args)
-    data = _http_get_json(build_question_url(question_id))
+    site = _validate_site(args.get("site"))
+    data = _http_get_json(build_question_url(question_id, site))
     _check_api_error(data)
+    _log_backoff(data)
     return format_question(data)
 
 
@@ -272,18 +408,33 @@ def tool_so_get_answers(args):
     args = _require_object(args)
     question_id = _parse_question_id(args)
     top = clamp(args.get("top", 3), 1, 10)
-    data = _http_get_json(build_answers_url(question_id, top))
+    site = _validate_site(args.get("site"))
+    data = _http_get_json(build_answers_url(question_id, top, site))
     _check_api_error(data)
+    _log_backoff(data)
     return format_answers(data, top)
 
+
+_SITE_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Stack Exchange site key (default 'stackoverflow'). Set this to search "
+        "a different site in the Stack Exchange network instead of Stack "
+        "Overflow, e.g. 'askubuntu' (Ask Ubuntu), 'superuser' (Super User), "
+        "'serverfault' (Server Fault), 'unix' (Unix & Linux), or 'math' "
+        "(Mathematics)."
+    ),
+    "default": "stackoverflow",
+}
 
 TOOLS = [
     {
         "name": "so_search",
         "description": (
-            "Searches Stack Overflow for questions matching a text query, "
-            "optionally filtered by tag. Use this to find relevant questions "
-            "before drilling into a specific one with so_get_question or "
+            "Searches Stack Overflow (or another Stack Exchange site via "
+            "'site') for questions matching a text query, optionally "
+            "filtered by tag. Use this to find relevant questions before "
+            "drilling into a specific one with so_get_question or "
             "so_get_answers."
         ),
         "inputSchema": {
@@ -298,6 +449,7 @@ TOOLS = [
                     "minimum": 1,
                     "maximum": 20,
                 },
+                "site": _SITE_PROPERTY,
             },
             "required": ["query"],
         },
@@ -305,14 +457,16 @@ TOOLS = [
     {
         "name": "so_get_question",
         "description": (
-            "Fetches a Stack Overflow question by ID: title, tags, score, "
-            "link, and full body text. Use this once you have a question_id "
-            "(e.g. from so_search) and need the full question content."
+            "Fetches a question by ID from Stack Overflow (or another Stack "
+            "Exchange site via 'site'): title, tags, score, link, and full "
+            "body text. Use this once you have a question_id (e.g. from "
+            "so_search) and need the full question content."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "question_id": {"type": "integer", "description": "question ID"},
+                "site": _SITE_PROPERTY,
             },
             "required": ["question_id"],
         },
@@ -320,9 +474,10 @@ TOOLS = [
     {
         "name": "so_get_answers",
         "description": (
-            "Fetches the top answers to a Stack Overflow question (accepted "
-            "answer first, then ordered by vote score). Use this to read "
-            "solutions once you have a question_id."
+            "Fetches the top answers to a question from Stack Overflow (or "
+            "another Stack Exchange site via 'site') - accepted answer "
+            "first, then ordered by vote score. Use this to read solutions "
+            "once you have a question_id."
         ),
         "inputSchema": {
             "type": "object",
@@ -335,6 +490,7 @@ TOOLS = [
                     "minimum": 1,
                     "maximum": 10,
                 },
+                "site": _SITE_PROPERTY,
             },
             "required": ["question_id"],
         },
@@ -360,6 +516,21 @@ def _error_response(msg_id, code, message):
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
+def _coerce_params(params):
+    """Returns `params` as a dict for methods that need object params.
+
+    None (params omitted) becomes {}. Anything else that isn't a dict
+    raises ValueError - callers turn that into a clean -32602 Invalid
+    params response instead of letting a later `.get()` call raise
+    AttributeError (e.g. params sent as a string or a list).
+    """
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise ValueError("'params' must be an object")
+    return params
+
+
 def handle_message(msg):
     """Dispatches an already-parsed JSON-RPC message. Returns a response dict
     or None when the message is a notification (no 'id', no response).
@@ -383,8 +554,18 @@ def handle_message(msg):
         return None
 
     if method == "initialize":
-        params = msg.get("params") or {}
-        protocol_version = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
+        try:
+            params = _coerce_params(msg.get("params"))
+        except ValueError:
+            return _error_response(msg_id, -32602, "Invalid params")
+        requested_version = params.get("protocolVersion")
+        if requested_version in SUPPORTED_PROTOCOL_VERSIONS:
+            protocol_version = requested_version
+        else:
+            # unsupported (or missing) version: per the MCP spec, respond
+            # with the most recent version this server does support instead
+            # of dishonestly echoing back a version it can't honor
+            protocol_version = SUPPORTED_PROTOCOL_VERSIONS[0]
         result = {
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {}},
@@ -399,7 +580,10 @@ def handle_message(msg):
         return _result_response(msg_id, {"tools": TOOLS})
 
     if method == "tools/call":
-        params = msg.get("params") or {}
+        try:
+            params = _coerce_params(msg.get("params"))
+        except ValueError:
+            return _error_response(msg_id, -32602, "Invalid params")
         name = params.get("name")
         arguments = params.get("arguments") or {}
         handler = TOOL_HANDLERS.get(name)
@@ -431,7 +615,33 @@ def handle_message(msg):
 # stdio loop
 # --------------------------------------------------------------------------
 
+def _startup_message():
+    """Returns the keyless/keyed startup line logged to stderr on boot.
+
+    Never includes the key's value - only whether one is set - so the
+    operator can tell at a glance which quota ceiling applies (300/day
+    keyless vs 10,000/day with a free key) without the key ever touching
+    a log line.
+    """
+    if os.environ.get("STACKEXCHANGE_KEY"):
+        return "[stackoverflow-mcp] starting with an API key: up to 10,000 requests/day"
+    return (
+        "[stackoverflow-mcp] starting in keyless mode: 300 API requests/day per IP "
+        "(set STACKEXCHANGE_KEY to raise it to 10,000/day)"
+    )
+
+
 def main():
+    print(_startup_message(), file=sys.stderr)
+    try:
+        # a malformed (non-UTF-8) byte on stdin must never kill the process:
+        # without this, a single bad byte raises UnicodeDecodeError straight
+        # out of the `for raw_line in sys.stdin` iteration itself, outside
+        # every try/except below, and the server exits.
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass  # stdin may have been replaced by something without reconfigure (e.g. tests)
+
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -440,13 +650,23 @@ def main():
             msg = json.loads(line)
         except json.JSONDecodeError as exc:
             print(f"[stackoverflow-mcp] invalid JSON on input: {exc}", file=sys.stderr)
+            # JSON-RPC requires a response even when the request itself
+            # couldn't be parsed enough to know its id
+            response = _error_response(None, -32700, "Parse error")
+            sys.stdout.write(json.dumps(response) + "\n")
+            sys.stdout.flush()
             continue
 
         try:
             response = handle_message(msg)
         except Exception as exc:  # never crash the server on a dispatch error
             print(f"[stackoverflow-mcp] unexpected dispatch error: {exc}", file=sys.stderr)
-            continue
+            # every request with an id is owed a response (JSON-RPC 2.0);
+            # silently dropping it would hang the caller until its timeout
+            if isinstance(msg, dict) and "id" in msg:
+                response = _error_response(msg.get("id"), -32603, "Internal error")
+            else:
+                response = None
 
         if response is not None:
             sys.stdout.write(json.dumps(response) + "\n")

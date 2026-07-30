@@ -6,9 +6,12 @@ Live (network) integration test is gated by SO_MCP_LIVE=1 (opt-in, does not
 run by default).
 """
 import gzip
+import io
 import json
 import os
 import socket
+import subprocess
+import sys
 import unittest
 import urllib.error
 from unittest.mock import MagicMock, patch
@@ -73,6 +76,33 @@ FIXTURE_API_ERROR = {
     "error_id": 400,
     "error_message": "bad parameter question_id",
     "error_name": "bad_parameter",
+}
+
+FIXTURE_SEARCH_LOW_QUOTA = {
+    "items": [
+        {
+            "question_id": 111,
+            "title": "How to do X in Python?",
+            "score": 10,
+            "is_answered": True,
+            "link": "https://stackoverflow.com/questions/111",
+        }
+    ],
+    "quota_remaining": 5,
+}
+
+FIXTURE_SEARCH_BACKOFF = {
+    "items": [
+        {
+            "question_id": 111,
+            "title": "How to do X in Python?",
+            "score": 10,
+            "is_answered": True,
+            "link": "https://stackoverflow.com/questions/111",
+        }
+    ],
+    "quota_remaining": 250,
+    "backoff": 10,
 }
 
 
@@ -141,6 +171,46 @@ class TestBuildUrls(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             url = server.build_question_url(1)
         self.assertNotIn("key=", url)
+
+    def test_search_default_site(self):
+        url = server.build_search_url("x")
+        self.assertIn("site=stackoverflow", url)
+
+    def test_search_custom_site(self):
+        url = server.build_search_url("x", site="askubuntu")
+        self.assertIn("site=askubuntu", url)
+
+    def test_question_custom_site(self):
+        url = server.build_question_url(1, site="askubuntu")
+        self.assertIn("site=askubuntu", url)
+
+    def test_answers_custom_site(self):
+        url = server.build_answers_url(1, site="askubuntu")
+        self.assertIn("site=askubuntu", url)
+
+
+class TestValidateSite(unittest.TestCase):
+    def test_none_defaults_to_stackoverflow(self):
+        self.assertEqual(server._validate_site(None), "stackoverflow")
+
+    def test_valid_site_passes_through(self):
+        self.assertEqual(server._validate_site("askubuntu"), "askubuntu")
+
+    def test_site_with_dot_passes(self):
+        self.assertEqual(server._validate_site("money.stackexchange"), "money.stackexchange")
+
+    def test_rejects_space(self):
+        with self.assertRaises(ValueError) as ctx:
+            server._validate_site("foo bar")
+        self.assertIn("Stack Exchange site key", str(ctx.exception))
+
+    def test_rejects_path_traversal(self):
+        with self.assertRaises(ValueError):
+            server._validate_site("../evil")
+
+    def test_rejects_non_string(self):
+        with self.assertRaises(ValueError):
+            server._validate_site(123)
 
 
 class TestHtmlToText(unittest.TestCase):
@@ -220,6 +290,50 @@ class TestFormatters(unittest.TestCase):
         self.assertLess(text.index("Use B"), text.index("Try A"))
         self.assertIn("accepted", text)
 
+    def test_format_search_low_quota_warning(self):
+        with patch.dict(os.environ, {}, clear=True):
+            text = server.format_search(FIXTURE_SEARCH_LOW_QUOTA)
+        self.assertIn("WARNING", text)
+        self.assertIn("5", text)
+
+    def test_format_search_high_quota_no_warning(self):
+        text = server.format_search(FIXTURE_SEARCH)  # quota_remaining: 299
+        self.assertNotIn("WARNING", text)
+
+    def test_format_search_backoff_note(self):
+        text = server.format_search(FIXTURE_SEARCH_BACKOFF)
+        self.assertIn("backoff of 10s", text)
+
+    def test_format_search_no_backoff_no_note(self):
+        text = server.format_search(FIXTURE_SEARCH)
+        self.assertNotIn("backoff", text)
+
+    def test_low_quota_warning_mentions_key_only_when_keyless(self):
+        with patch.dict(os.environ, {}, clear=True):
+            text = server.format_search(FIXTURE_SEARCH_LOW_QUOTA)
+        self.assertIn("STACKEXCHANGE_KEY", text)
+
+    def test_low_quota_warning_omits_key_when_already_keyed(self):
+        with patch.dict(os.environ, {"STACKEXCHANGE_KEY": "abc123"}):
+            text = server.format_search(FIXTURE_SEARCH_LOW_QUOTA)
+        self.assertNotIn("STACKEXCHANGE_KEY", text)
+
+
+class TestStartupMessage(unittest.TestCase):
+    def test_keyless_message(self):
+        with patch.dict(os.environ, {}, clear=True):
+            msg = server._startup_message()
+        self.assertIn("keyless mode", msg)
+        self.assertIn("300", msg)
+        self.assertIn("STACKEXCHANGE_KEY", msg)
+
+    def test_keyed_message_does_not_leak_key(self):
+        with patch.dict(os.environ, {"STACKEXCHANGE_KEY": "super-secret-key-999"}):
+            msg = server._startup_message()
+        self.assertIn("API key", msg)
+        self.assertIn("10,000", msg)
+        self.assertNotIn("super-secret-key-999", msg)
+
 
 class TestHttpGetJson(unittest.TestCase):
     """Exercises the network seam by mocking urllib.request.urlopen directly."""
@@ -276,6 +390,67 @@ class TestHttpGetJson(unittest.TestCase):
                 server._http_get_json("http://example.test")
         self.assertIn("not valid JSON", str(ctx.exception))
 
+    @staticmethod
+    def _make_http_error(body_bytes, code=400, reason="Bad Request"):
+        return urllib.error.HTTPError(
+            "http://example.test", code, reason, None, io.BytesIO(body_bytes)
+        )
+
+    def test_http_error_gzipped_throttle_body_mentions_stackexchange_key(self):
+        payload = json.dumps(
+            {
+                "error_id": 502,
+                "error_message": "too many requests from this client",
+                "error_name": "throttle_violation",
+            }
+        ).encode("utf-8")
+        http_error = self._make_http_error(gzip.compress(payload))
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_error):
+                with self.assertRaises(RuntimeError) as ctx:
+                    server._http_get_json("http://example.test")
+        finally:
+            http_error.close()
+        self.assertIn("STACKEXCHANGE_KEY", str(ctx.exception))
+        self.assertIn("502", str(ctx.exception))
+        self.assertIn("throttle_violation", str(ctx.exception))
+
+    def test_http_error_gzipped_body_has_no_replacement_characters(self):
+        payload = json.dumps(
+            {"error_id": 502, "error_message": "throttled", "error_name": "throttle_violation"}
+        ).encode("utf-8")
+        http_error = self._make_http_error(gzip.compress(payload))
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_error):
+                with self.assertRaises(RuntimeError) as ctx:
+                    server._http_get_json("http://example.test")
+        finally:
+            http_error.close()
+        self.assertNotIn("�", str(ctx.exception))
+
+    def test_http_error_plain_json_body_is_parsed(self):
+        payload = json.dumps(
+            {"error_id": 400, "error_message": "bad parameter site", "error_name": "bad_parameter"}
+        ).encode("utf-8")
+        http_error = self._make_http_error(payload)
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_error):
+                with self.assertRaises(RuntimeError) as ctx:
+                    server._http_get_json("http://example.test")
+        finally:
+            http_error.close()
+        self.assertIn("bad parameter site", str(ctx.exception))
+
+    def test_http_error_garbage_body_falls_back_to_generic_message(self):
+        http_error = self._make_http_error(b"\x00\x01not json or gzip")
+        try:
+            with patch("urllib.request.urlopen", side_effect=http_error):
+                with self.assertRaises(RuntimeError) as ctx:
+                    server._http_get_json("http://example.test")
+        finally:
+            http_error.close()
+        self.assertIn("HTTP error 400", str(ctx.exception))
+
 
 class TestParseQuestionId(unittest.TestCase):
     def test_int_is_accepted(self):
@@ -310,22 +485,39 @@ class TestParseQuestionId(unittest.TestCase):
 
 
 class TestDispatch(unittest.TestCase):
-    def test_initialize_echoes_protocol_version(self):
+    def test_initialize_echoes_supported_protocol_version(self):
+        version = server.SUPPORTED_PROTOCOL_VERSIONS[-1]  # oldest supported, still valid
         msg = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"protocolVersion": "2025-01-01"},
+            "params": {"protocolVersion": version},
         }
         resp = server.handle_message(msg)
-        self.assertEqual(resp["result"]["protocolVersion"], "2025-01-01")
+        self.assertEqual(resp["result"]["protocolVersion"], version)
         self.assertEqual(resp["result"]["serverInfo"]["name"], "stackoverflow")
         self.assertIn("tools", resp["result"]["capabilities"])
 
-    def test_initialize_default_protocol_version(self):
+    def test_initialize_missing_protocol_version_falls_back_to_latest_supported(self):
         msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
         resp = server.handle_message(msg)
-        self.assertEqual(resp["result"]["protocolVersion"], "2024-11-05")
+        self.assertEqual(resp["result"]["protocolVersion"], server.SUPPORTED_PROTOCOL_VERSIONS[0])
+
+    def test_initialize_unsupported_protocol_version_falls_back_to_latest_supported(self):
+        # a server must not dishonestly claim to support a version it doesn't
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2099-01-01"},
+        }
+        resp = server.handle_message(msg)
+        self.assertEqual(resp["result"]["protocolVersion"], server.SUPPORTED_PROTOCOL_VERSIONS[0])
+
+    def test_initialize_non_dict_params_is_invalid_params(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": "x"}
+        resp = server.handle_message(msg)
+        self.assertEqual(resp["error"]["code"], -32602)
 
     def test_notification_initialized_returns_none(self):
         msg = {"jsonrpc": "2.0", "method": "notifications/initialized"}
@@ -344,6 +536,12 @@ class TestDispatch(unittest.TestCase):
             self.assertIn("description", tool)
             self.assertIn("inputSchema", tool)
             self.assertEqual(tool["inputSchema"]["type"], "object")
+
+    def test_tools_list_includes_site_param(self):
+        msg = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        resp = server.handle_message(msg)
+        for tool in resp["result"]["tools"]:
+            self.assertIn("site", tool["inputSchema"]["properties"])
 
     def test_ping(self):
         msg = {"jsonrpc": "2.0", "id": 3, "method": "ping"}
@@ -503,6 +701,11 @@ class TestToolsCall(unittest.TestCase):
         self.assertIn("accepted", text)
         self.assertIn("Use B", text)
 
+    def test_tools_call_non_dict_params_is_invalid_params(self):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["x"]}
+        resp = server.handle_message(msg)
+        self.assertEqual(resp["error"]["code"], -32602)
+
     def test_unknown_tool_is_error(self):
         msg = {
             "jsonrpc": "2.0",
@@ -539,6 +742,148 @@ class TestToolsCall(unittest.TestCase):
         resp = server.handle_message(msg)
         self.assertTrue(resp["result"]["isError"])
         self.assertIn("bad parameter", resp["result"]["content"][0]["text"])
+
+    def test_so_search_custom_site_reaches_the_url(self):
+        captured = {}
+
+        def fake_http_get_json(url):
+            captured["url"] = url
+            return FIXTURE_SEARCH
+
+        server._http_get_json = fake_http_get_json
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "so_search",
+                "arguments": {"query": "python", "site": "askubuntu"},
+            },
+        }
+        resp = server.handle_message(msg)
+        self.assertNotIn("isError", resp["result"])
+        self.assertIn("site=askubuntu", captured["url"])
+
+    def test_so_search_malformed_site_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_SEARCH
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "so_search",
+                "arguments": {"query": "python", "site": "foo bar"},
+            },
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+        self.assertIn("site", resp["result"]["content"][0]["text"])
+
+    def test_so_search_path_traversal_site_is_clean_error(self):
+        server._http_get_json = lambda url: FIXTURE_SEARCH
+        msg = {
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "so_search",
+                "arguments": {"query": "python", "site": "../evil"},
+            },
+        }
+        resp = server.handle_message(msg)
+        self.assertTrue(resp["result"]["isError"])
+
+    def test_stackexchange_key_never_leaks_in_http_error_message(self):
+        with patch.dict(os.environ, {"STACKEXCHANGE_KEY": "super-secret-key-999"}):
+            url = server.build_question_url(1)
+            self.assertIn("super-secret-key-999", url)  # sanity: the key is really in the URL
+            http_error = urllib.error.HTTPError(
+                url, 400, "Bad Request", None, io.BytesIO(b"plain text error body")
+            )
+            try:
+                with patch("urllib.request.urlopen", side_effect=http_error):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        server._http_get_json(url)
+            finally:
+                http_error.close()
+        self.assertNotIn("super-secret-key-999", str(ctx.exception))
+
+    def test_stackexchange_key_never_leaks_in_tool_error_text(self):
+        # end-to-end through the real network seam: build_question_url puts
+        # the key in the URL, urlopen raises a real HTTPError carrying that
+        # same URL, and the text that reaches the MCP client must not.
+        with patch.dict(os.environ, {"STACKEXCHANGE_KEY": "super-secret-key-999"}):
+            url = server.build_question_url(1)
+            self.assertIn("super-secret-key-999", url)  # sanity: key reached the URL
+            http_error = urllib.error.HTTPError(
+                url, 400, "Bad Request", None, io.BytesIO(b"plain text error body")
+            )
+            try:
+                with patch("urllib.request.urlopen", side_effect=http_error):
+                    msg = {
+                        "jsonrpc": "2.0",
+                        "id": 14,
+                        "method": "tools/call",
+                        "params": {"name": "so_get_question", "arguments": {"question_id": 1}},
+                    }
+                    resp = server.handle_message(msg)
+            finally:
+                http_error.close()
+        text = resp["result"]["content"][0]["text"]
+        self.assertNotIn("super-secret-key-999", text)
+
+
+class TestStdioProcessSurvives(unittest.TestCase):
+    """End-to-end: spawns the real server as a subprocess and feeds it lines
+    that used to be able to kill it or leave a request unanswered."""
+
+    def test_survives_bad_json_and_bad_utf8_bytes_and_still_answers(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
+        proc = subprocess.Popen(
+            [sys.executable, script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            proc.stdin.write(b"this is not json at all\n")
+            # invalid UTF-8 bytes embedded in an otherwise well-formed line;
+            # this used to raise UnicodeDecodeError out of the stdin
+            # iterator itself and kill the whole process
+            proc.stdin.write(
+                b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"\xff\xfe"}}\n'
+            )
+            proc.stdin.write(
+                (
+                    json.dumps(
+                        {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+            proc.stdin.close()
+            out, _err = proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+
+        self.assertEqual(proc.returncode, 0, "the server process must not crash/exit")
+
+        lines = [line for line in out.decode("utf-8", errors="replace").splitlines() if line.strip()]
+        responses = [json.loads(line) for line in lines]
+        self.assertEqual(len(responses), 3, f"expected one response per input line, got {responses}")
+
+        # line 1: invalid JSON -> Parse error with id: null
+        self.assertEqual(responses[0]["error"]["code"], -32700)
+        self.assertIsNone(responses[0]["id"])
+
+        # line 2: survived the bad bytes (replaced, not fatal) and got a response
+        self.assertEqual(responses[1]["id"], 1)
+
+        # line 3: process is still alive and dispatches normally afterwards
+        self.assertEqual(responses[2]["id"], 2)
+        self.assertIn("protocolVersion", responses[2]["result"])
 
 
 class TestLive(unittest.TestCase):
