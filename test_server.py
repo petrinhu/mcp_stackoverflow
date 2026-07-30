@@ -839,6 +839,24 @@ class TestStdioProcessSurvives(unittest.TestCase):
 
     def test_survives_bad_json_and_bad_utf8_bytes_and_still_answers(self):
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
+        # Build the whole payload up front and hand it to communicate() in
+        # one shot. communicate(input=...) writes, closes stdin, and reads
+        # stdout/stderr itself without racing anyone else's close() - writing
+        # via proc.stdin.write() and then calling proc.stdin.close()
+        # ourselves before communicate() races CPython's own internal
+        # flush() on close of the same pipe on Python < 3.13, raising
+        # ValueError("flush of closed file") there (fixed upstream in 3.13).
+        payload = (
+            b"this is not json at all\n"
+            # invalid UTF-8 bytes embedded in an otherwise well-formed line;
+            # this used to raise UnicodeDecodeError out of the stdin
+            # iterator itself and kill the whole process
+            b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"\xff\xfe"}}\n'
+            + (
+                json.dumps({"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}})
+                + "\n"
+            ).encode("utf-8")
+        )
         proc = subprocess.Popen(
             [sys.executable, script],
             stdin=subprocess.PIPE,
@@ -846,27 +864,11 @@ class TestStdioProcessSurvives(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         try:
-            proc.stdin.write(b"this is not json at all\n")
-            # invalid UTF-8 bytes embedded in an otherwise well-formed line;
-            # this used to raise UnicodeDecodeError out of the stdin
-            # iterator itself and kill the whole process
-            proc.stdin.write(
-                b'{"jsonrpc":"2.0","id":1,"method":"ping","params":{"x":"\xff\xfe"}}\n'
-            )
-            proc.stdin.write(
-                (
-                    json.dumps(
-                        {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
-                    )
-                    + "\n"
-                ).encode("utf-8")
-            )
-            proc.stdin.close()
-            out, _err = proc.communicate(timeout=10)
+            out, _err = proc.communicate(input=payload, timeout=10)
         finally:
             if proc.poll() is None:
                 proc.kill()
-                proc.communicate()
+                proc.wait()
 
         self.assertEqual(proc.returncode, 0, "the server process must not crash/exit")
 

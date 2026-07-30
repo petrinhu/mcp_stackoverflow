@@ -21,7 +21,7 @@ API_BASE = "https://api.stackexchange.com/2.3"
 DEFAULT_SITE = "stackoverflow"
 HTTP_TIMEOUT_S = 20
 SERVER_NAME = "stackoverflow"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 # Ordered newest-first: a supported version is echoed back as-is; an
 # unsupported (or missing) one falls back to SUPPORTED_PROTOCOL_VERSIONS[0].
 SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")

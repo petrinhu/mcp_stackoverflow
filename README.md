@@ -1,8 +1,14 @@
 # mcp_stackoverflow
 
-A small, **dependency-free** [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives any MCP client (Claude Code, Claude Desktop, Cursor, VS Code, ...) read access to **Stack Overflow** through the classic **Stack Exchange REST API** (`api.stackexchange.com/2.3`).
+[![CI](https://github.com/petrinhu/mcp_stackoverflow/actions/workflows/ci.yml/badge.svg)](https://github.com/petrinhu/mcp_stackoverflow/actions/workflows/ci.yml)
+[![License: AGPL v3+](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Zero dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-brightgreen.svg)](#how-it-is-built)
+[![MCP](https://img.shields.io/badge/MCP-stdio%20server-informational.svg)](https://modelcontextprotocol.io)
 
-It exposes three tools so an AI assistant can search Stack Overflow, pull a question, and read its top answers to ground its responses in community-verified content.
+A small, **dependency-free** [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that gives any MCP client (Claude Code, Claude Desktop, Cursor, VS Code, ...) read access to **Stack Overflow and the whole Stack Exchange network** through the classic **Stack Exchange REST API** (`api.stackexchange.com/2.3`).
+
+It exposes three tools so an AI assistant can search questions, pull a question, and read its top answers to ground its responses in community-verified content.
 
 ---
 
@@ -33,16 +39,20 @@ A separate Node/HTTP process cannot inherit the browser's `cf_clearance` cookie,
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `so_search` | `query` (required), `tag` (optional), `pagesize` (1..20, default 5) | ranked question list: id, score, title, answered flag, link |
-| `so_get_question` | `question_id` | title, tags, score, link, body |
-| `so_get_answers` | `question_id`, `top` (1..10, default 3) | top answers (accepted first, then by votes) with body |
+| `so_search` | `query` (required), `tag` (optional), `pagesize` (1..20, default 5), `site` (optional, default `stackoverflow`) | ranked question list: id, score, title, answered flag, link |
+| `so_get_question` | `question_id` (required), `site` (optional, default `stackoverflow`) | title, tags, score, link, body |
+| `so_get_answers` | `question_id` (required), `top` (1..10, default 3), `site` (optional, default `stackoverflow`) | top answers (accepted first, then by votes) with body |
+
+`site` accepts any Stack Exchange site key, not just Stack Overflow: `askubuntu`, `superuser`, `serverfault`, `unix` (Unix & Linux), `math` (Mathematics), and the rest of the network. It defaults to `stackoverflow`, so existing calls that omit it behave exactly as before.
 
 ---
 
 ## Requirements
 
-- **Python 3.8+** (standard library only, nothing to `pip install`).
+- **Python 3.10+** (standard library only, nothing to `pip install`). Below 3.10, `socket.timeout` is not an alias of the built-in `TimeoutError`, so the network-timeout handling in this server does not hold on older interpreters; Python 3.8/3.9 are also EOL (3.8 since October 2024).
 - An **MCP-compatible client** (Claude Code, Claude Desktop, Cursor, VS Code, ...).
+
+CI proves the supported range on every push: Python 3.10, 3.11, 3.12, 3.13, and 3.14 on Linux, plus 3.12 on Windows and macOS (7 jobs total).
 
 ---
 
@@ -88,16 +98,29 @@ Once connected, the tools are available to the assistant automatically. Just ask
 - "Search Stack Overflow for `asyncio gather vs wait`."
 - "Show me the accepted answer and top answers for question 4260280."
 - "Find questions tagged `rust` about lifetime elision."
+- "Search Ask Ubuntu for how to fix a broken `apt` lock file." (uses `site: askubuntu`)
 
-The assistant decides when to call `so_search`, `so_get_question`, and `so_get_answers`.
+The assistant decides when to call `so_search`, `so_get_question`, and `so_get_answers`, including which `site` to target.
 
 ---
 
-## API quota and optional key
+## API quota: works with or without a key
 
-Without a key the Stack Exchange API allows **300 requests/day per IP**. A **free** [Stack Apps key](https://stackapps.com/apps/oauth/register) raises that to **10,000/day**. The key only raises quota; **no OAuth is needed for reads**.
+Using the server **without** a key is a fully supported, first-class way to run it: you just get a lower daily ceiling. Adding a key only raises that ceiling; it is **never required** for reads, because this API needs no OAuth.
 
-The server reads the key from the `STACKEXCHANGE_KEY` environment variable and **never** stores it in the repository.
+| Mode | Daily quota | Setup |
+|---|---|---|
+| Keyless (default) | 300 requests/day per IP | none |
+| With `STACKEXCHANGE_KEY` | 10,000 requests/day | free [Stack Apps key](https://stackapps.com/apps/oauth/register) |
+
+Quota handling is visible end-to-end, not silent:
+
+- **On startup**, the server logs to stderr which mode is active (keyless or keyed), without ever printing the key itself.
+- **When quota runs low**, the tool's response text includes a warning, plus a pointer to `STACKEXCHANGE_KEY` if you're still keyless.
+- **When the API asks for a backoff** before the next call, that is reported in the response text instead of the server sleeping; sleeping would freeze the whole stdio protocol loop, including unrelated requests.
+- **When the API is throttling the client** (quota exhausted), the error message explains what happened and links straight to the free key registration page, instead of surfacing raw gzip bytes.
+
+The server reads the key from the `STACKEXCHANGE_KEY` environment variable and **never** stores it in the repository or logs it.
 
 ```sh
 # Claude Code: pass it as an env var (kept in ~/.claude.json, which is not committed)
@@ -120,17 +143,28 @@ python3 -m unittest test_server                  # offline, HTTP is mocked
 SO_MCP_LIVE=1 python3 -m unittest test_server     # also runs one real API call
 ```
 
-The suite covers URL building (including quota-key injection and clamping), HTML-to-text conversion, result formatting, and the full JSON-RPC dispatch (`initialize`, `tools/list`, `tools/call`, notifications, error paths).
+The suite (97 tests) covers URL building (including quota-key injection, `site` selection, and clamping), HTML-to-text conversion, quota/backoff messaging, result formatting, and the full JSON-RPC dispatch (`initialize`, `tools/list`, `tools/call`, notifications, error paths).
 
 ---
 
 ## Architecture notes
 
-- `site` is fixed to `stackoverflow`.
 - `so_search` uses `/search/advanced` with `sort=relevance`; `so_get_question` and `so_get_answers` use `filter=withbody` to include content.
 - Answer ordering is **accepted answer first, then by score**.
 - Bodies arrive as HTML and are converted to text (markup is dropped, content is kept, which is what an LLM needs for grounding).
 - The server is stateless and is launched by your MCP client as a subprocess over stdio.
+
+For the internals (file layout, invariants, how to add a tool), see [`AGENTS.md`](AGENTS.md): that's the guide for anyone changing the code, not for plugging the server into a client.
+
+---
+
+## Contributing
+
+Issues and pull requests are welcome on [GitHub](https://github.com/petrinhu/mcp_stackoverflow). The test suite must pass before a PR is merged. Contributions are accepted under this project's license, AGPL-3.0-or-later. If you're changing `server.py`, read [`AGENTS.md`](AGENTS.md) first: it documents the invariants the server depends on.
+
+## Security
+
+To report a security issue, open an [issue on GitHub](https://github.com/petrinhu/mcp_stackoverflow/issues). The attack surface is intentionally small: the server is read-only, stores no credentials, and its only optional secret (`STACKEXCHANGE_KEY`) comes from an environment variable and is never logged or written to disk.
 
 ---
 
