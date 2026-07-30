@@ -1,0 +1,6 @@
+porte=solo
+variante=Pipeline-Sprint
+data=2026-07-30
+classificado_por=orquestrador (Cósimo não entregou o mapa após 4 pedidos)
+justificativa=MCP stdio de ~410 linhas, stdlib puro, 3 tools read-only, 1 mantenedor, open source sem receita, sem PII, sem compliance regulatória. C-levels ativos: Caetano (CTO, auditoria e plano). Dormentes: todos os demais — não há mercado a atacar (CMO/CRO/PMM), receita a modelar (CFO), dado como ativo (CDO), superfície regulatória (CLO/CISO além do básico) nem execução cross-funcional a coordenar (COO) num projeto de dois arquivos.
+gatilho_reavaliacao=se ganhar usuários externos com issues recorrentes, se passar a tratar credencial de terceiro, ou se a superfície passar de ~5 tools
