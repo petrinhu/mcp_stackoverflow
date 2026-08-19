@@ -6,6 +6,11 @@ Source: CTO audit of commit `b4e404d` (2026-07-30). Scope approved by the projec
 Status vocabulary (house contract, kept in pt-br): `⏳ Pendente` · `🔄 Em andamento` · `🟡 Parcial` · `💡 Decisão tomada` · `🎨 Pendente design` · `🔍 Pendente verificação` · `✅ Concluído`.
 `✅` is only set after test/audit — delivered implementation goes to `🔍` first.
 
+## INBOX
+
+- Track B items deliberately deferred until real usage demand (consumer-driven cadence): search filters (`accepted`, `answers>=N`, date range), pagination, and a `so_get_comments` tool. Each one is permanent public surface exposed to the LLM and spends the same daily quota.
+- Deliberately rejected as over-engineering, recorded so they are not re-proposed: automatic retry with sleep (would block the single-threaded stdio protocol, including `ping`), JSON-RPC batching (removed from the MCP spec in 2025-03-26), stdin line-size DoS guard (the client is the trusted local parent process), HTTP/2 and connection pooling.
+
 | ID | Onda | Grupo | Descrição Técnica | Prioridade | Pré-requisito | Dificuldade | Status | Estado Auditado |
 |---|---|---|---|---|---|---|---|---|
 | I18N-1 | 1 | i18n | Translate `server.py` + `test_server.py` to English: runtime strings the MCP client reads, tool/param descriptions, comments, docstrings and the matching test assertions | Alta | — | Média | ✅ Concluído | Auditado 8cf4631 + QA adversarial |
@@ -25,8 +30,3 @@ Status vocabulary (house contract, kept in pt-br): `⏳ Pendente` · `🔄 Em an
 | DOC-CLAUDE | 3 | Docs | Rewrite `CLAUDE.md` in English, short, pointing at `AGENTS.md` instead of duplicating it; drop the now-obsolete pt-br convention | Média | DOC-AGENTS | Baixa | ✅ Concluído | Auditado 8cf4631 + QA adversarial |
 | QA-FINAL | 4 | Auditoria | Independent adversarial audit by a `qa-engineer` (never an implementer): full suite, subprocess e2e, mutation spot-check, i18n sweep by enumeration, doc-vs-code consistency, real CI status | Crítica | Ondas 1-3 | Média | ✅ Concluído | Auditado 8cf4631 + QA adversarial |
 | WIKI-1 | 5 | Docs | Repo Wiki (GitHub wiki-native) + extensive beginner-level `.md` documentation explaining every piece of jargon, derived from the existing docs (links, does not duplicate). Runs via `technical-writer` | Baixa | Tag de versão | Alta | ⏳ Pendente | — |
-
-## INBOX
-
-- Track B items deliberately deferred until real usage demand (consumer-driven cadence): search filters (`accepted`, `answers>=N`, date range), pagination, and a `so_get_comments` tool. Each one is permanent public surface exposed to the LLM and spends the same daily quota.
-- Deliberately rejected as over-engineering, recorded so they are not re-proposed: automatic retry with sleep (would block the single-threaded stdio protocol, including `ping`), JSON-RPC batching (removed from the MCP spec in 2025-03-26), stdin line-size DoS guard (the client is the trusted local parent process), HTTP/2 and connection pooling.
